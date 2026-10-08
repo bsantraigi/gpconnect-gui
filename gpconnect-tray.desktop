@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GlobalProtect VPN
+GenericName=VPN Tray
+Comment=Connect to GlobalProtect VPN from the system tray
+Exec=gpconnect-tray
+Icon=network-vpn
+Terminal=false
+Categories=Network;Dialup;
+Keywords=GlobalProtect;VPN;OpenConnect;
+StartupNotify=false

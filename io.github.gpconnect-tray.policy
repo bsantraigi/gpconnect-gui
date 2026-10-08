@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>gpconnect-tray</vendor>
+  <icon_name>network-vpn</icon_name>
+  <action id="io.github.gpconnect-tray.connect">
+    <description>Connect to GlobalProtect VPN</description>
+    <message>Authentication is required to establish the GlobalProtect VPN tunnel</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>@ALLOW_ACTIVE@</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/gpconnect-tray/gpconnect-helper</annotate>
+  </action>
+</policyconfig>

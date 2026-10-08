@@ -1,0 +1,689 @@
+#!/usr/bin/python3
+"""GlobalProtect tray indicator for GlobalProtect-openconnect (gpclient/gpauth).
+
+Authentication (gpauth + browser) runs as the desktop user; only the tunnel
+itself (gpclient connect --cookie-on-stdin) is run as root, through pkexec and
+a small helper, so the browser never runs as root and no `sudo -E` is needed.
+"""
+
+import base64
+import collections
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Notify", "0.7")
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+except (ValueError, ImportError):
+    try:
+        gi.require_version("AppIndicator3", "0.1")
+        from gi.repository import AppIndicator3 as AppIndicator
+    except (ValueError, ImportError):
+        sys.exit(
+            "No AppIndicator library found. Install it with:\n"
+            "  sudo apt install gir1.2-ayatanaappindicator3-0.1"
+        )
+from gi.repository import Gio, GLib, Gtk, Notify, Pango  # noqa: E402
+
+APP_ID = "io.github.gpconnect-tray"
+APP_NAME = "GlobalProtect VPN"
+HELPER = "/usr/local/libexec/gpconnect-tray/gpconnect-helper"
+GPCLIENT_LOCK = "/var/run/gpclient.lock"
+
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "gpconnect-tray")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+AUTOSTART_FILE = os.path.join(GLib.get_user_config_dir(), "autostart", "gpconnect-tray.desktop")
+LOG_FILE = os.path.join(GLib.get_user_cache_dir(), "gpconnect-tray", "gpconnect.log")
+
+DEFAULT_CONFIG = {
+    "portal": "",
+    "browser": "microsoft-edge-stable",
+    "gateway": "",  # empty = automatic
+    "known_gateways": [],
+    "disable_ipv6": True,
+    "fix_openssl": True,
+    "connect_on_start": False,
+}
+
+BROWSERS = [
+    ("microsoft-edge-stable", "Microsoft Edge"),
+    ("google-chrome", "Google Chrome"),
+    ("chromium", "Chromium"),
+    ("firefox", "Firefox"),
+    ("default", "System default browser"),
+    ("embedded", "Embedded login window"),
+]
+
+AUTOSTART_DESKTOP = """[Desktop Entry]
+Type=Application
+Name=GlobalProtect VPN
+Comment=GlobalProtect VPN tray indicator
+Exec={exec}
+Icon=network-vpn
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
+NoDisplay=false
+"""
+
+CONNECTED_RE = re.compile(r"Connected to VPN|Wrote PID \d+ to .*gpclient\.lock")
+GATEWAY_RE = re.compile(r"Connecting to the selected gateway: (.+?) \(([^)]+)\)\s*$")
+
+DISCONNECTED, AUTHENTICATING, CONNECTING, CONNECTED, DISCONNECTING = range(5)
+
+STATE_INFO = {
+    DISCONNECTED: ("Disconnected", ["network-vpn-disconnected-symbolic", "network-vpn-disabled-symbolic", "network-vpn"]),
+    AUTHENTICATING: ("Waiting for sign-in…", ["network-vpn-acquiring-symbolic", "network-vpn-acquiring", "network-vpn"]),
+    CONNECTING: ("Connecting…", ["network-vpn-acquiring-symbolic", "network-vpn-acquiring", "network-vpn"]),
+    CONNECTED: ("Connected", ["network-vpn-symbolic", "network-vpn"]),
+    DISCONNECTING: ("Disconnecting…", ["network-vpn-acquiring-symbolic", "network-vpn-acquiring", "network-vpn"]),
+}
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def tunnel_is_up():
+    """A connected gpclient (ours or started from a terminal) writes its PID to the lock file."""
+    try:
+        with open(GPCLIENT_LOCK) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip().startswith("gpclient")
+    except (OSError, ValueError):
+        return False
+
+
+def first_icon(names):
+    theme = Gtk.IconTheme.get_default()
+    for name in names:
+        if theme.has_icon(name):
+            return name
+    return names[-1]
+
+
+def strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s)
+
+
+class LogWindow(Gtk.Window):
+    def __init__(self, app):
+        super().__init__(title=f"{APP_NAME} — Log")
+        self.app = app
+        self.set_default_size(760, 440)
+        self.set_icon_name("network-vpn")
+
+        header = Gtk.HeaderBar(show_close_button=True, title="Connection Log")
+        clear = Gtk.Button.new_from_icon_name("edit-clear-all-symbolic", Gtk.IconSize.BUTTON)
+        clear.set_tooltip_text("Clear log")
+        clear.connect("clicked", lambda *_: self.app.clear_log())
+        header.pack_end(clear)
+        copy = Gtk.Button.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.BUTTON)
+        copy.set_tooltip_text("Copy to clipboard")
+        copy.connect("clicked", self._copy)
+        header.pack_end(copy)
+        self.set_titlebar(header)
+
+        self.view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                                 wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                 left_margin=10, right_margin=10, top_margin=8, bottom_margin=8)
+        self.buffer = self.view.get_buffer()
+        scroller = Gtk.ScrolledWindow()
+        scroller.add(self.view)
+        self.add(scroller)
+        self.connect("delete-event", lambda *_: self.hide() or True)
+
+    def set_text(self, text):
+        self.buffer.set_text(text)
+        self._scroll_end()
+
+    def append(self, line):
+        self.buffer.insert(self.buffer.get_end_iter(), line + "\n")
+        self._scroll_end()
+
+    def _scroll_end(self):
+        mark = self.buffer.get_insert()
+        self.buffer.place_cursor(self.buffer.get_end_iter())
+        self.view.scroll_mark_onscreen(mark)
+
+    def _copy(self, *_):
+        start, end = self.buffer.get_bounds()
+        Gtk.Clipboard.get_default(self.get_display()).set_text(self.buffer.get_text(start, end, False), -1)
+
+
+class SettingsDialog(Gtk.Dialog):
+    def __init__(self, app):
+        use_header = Gtk.Settings.get_default().props.gtk_dialogs_use_header
+        super().__init__(title=f"{APP_NAME} Settings", use_header_bar=use_header)
+        self.app = app
+        self.set_icon_name("network-vpn")
+        self.set_default_size(520, -1)
+        self.set_resizable(False)
+        self.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Save", Gtk.ResponseType.OK)
+        self.set_default_response(Gtk.ResponseType.OK)
+        save_btn = self.get_widget_for_response(Gtk.ResponseType.OK)
+        save_btn.get_style_context().add_class("suggested-action")
+
+        cfg = app.config
+        box = self.get_content_area()
+        box.set_border_width(18)
+        box.set_spacing(18)
+
+        self.portal = Gtk.Entry(text=cfg["portal"], hexpand=True, activates_default=True,
+                                placeholder_text="https://vpn.example.com")
+        self.browser = Gtk.ComboBoxText.new_with_entry()
+        for key, label in BROWSERS:
+            self.browser.append(key, label)
+        if not self.browser.set_active_id(cfg["browser"]):
+            self.browser.get_child().set_text(cfg["browser"])
+        self.gateway = Gtk.ComboBoxText.new_with_entry()
+        self.gateway.append("", "Automatic")
+        for gw in gateway_choices(cfg):
+            self.gateway.append(gw, gw)
+        self.gateway.set_active_id(cfg["gateway"])
+        self.gateway.get_child().set_placeholder_text("Automatic, or a gateway name")
+
+        self.disable_ipv6 = Gtk.Switch(active=cfg["disable_ipv6"], valign=Gtk.Align.CENTER)
+        self.fix_openssl = Gtk.Switch(active=cfg["fix_openssl"], valign=Gtk.Align.CENTER)
+        self.connect_on_start = Gtk.Switch(active=cfg["connect_on_start"], valign=Gtk.Align.CENTER)
+        self.autostart = Gtk.Switch(active=os.path.exists(AUTOSTART_FILE), valign=Gtk.Align.CENTER)
+
+        box.pack_start(self._group("Connection", [
+            ("Portal", None, self.portal),
+            ("Sign-in browser", None, self.browser),
+            ("Gateway", None, self.gateway),
+        ], stacked=True), False, False, 0)
+        box.pack_start(self._group("Options", [
+            ("Disable IPv6", "Do not request IPv6 connectivity", self.disable_ipv6),
+            ("OpenSSL compatibility mode", "Equivalent to --fix-openssl", self.fix_openssl),
+        ]), False, False, 0)
+        box.pack_start(self._group("Startup", [
+            ("Start at login", "Show the tray icon when you log in", self.autostart),
+            ("Connect automatically", "Connect as soon as the app starts", self.connect_on_start),
+        ]), False, False, 0)
+        self.show_all()
+
+    def _group(self, title, rows, stacked=False):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        heading = Gtk.Label(xalign=0)
+        heading.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
+        outer.pack_start(heading, False, False, 0)
+
+        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        frame = Gtk.Frame()
+        frame.add(listbox)
+        outer.pack_start(frame, False, False, 0)
+
+        for label, subtitle, widget in rows:
+            row = Gtk.ListBoxRow(activatable=False)
+            grid = Gtk.Grid(column_spacing=12, margin=10, margin_start=12, margin_end=12)
+            texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
+            lbl = Gtk.Label(label=label, xalign=0)
+            texts.pack_start(lbl, False, False, 0)
+            if subtitle:
+                sub = Gtk.Label(label=subtitle, xalign=0)
+                sub.get_style_context().add_class("dim-label")
+                attrs = Pango.AttrList()
+                attrs.insert(Pango.attr_scale_new(0.9))
+                sub.set_attributes(attrs)
+                texts.pack_start(sub, False, False, 0)
+            if stacked or not isinstance(widget, Gtk.Switch):
+                lbl.set_size_request(130, -1)
+            texts.set_hexpand(isinstance(widget, Gtk.Switch))
+            grid.attach(texts, 0, 0, 1, 1)
+            grid.attach(widget, 1, 0, 1, 1)
+            row.add(grid)
+            listbox.add(row)
+        return outer
+
+    def apply(self):
+        cfg = self.app.config
+        cfg["portal"] = self.portal.get_text().strip()
+        browser_id = self.browser.get_active_id()
+        cfg["browser"] = browser_id or self.browser.get_child().get_text().strip() or "default"
+        gw = self.gateway.get_child().get_text().strip()
+        cfg["gateway"] = "" if gw == "Automatic" else gw
+        remember_gateway(cfg, cfg["gateway"])
+        cfg["disable_ipv6"] = self.disable_ipv6.get_active()
+        cfg["fix_openssl"] = self.fix_openssl.get_active()
+        cfg["connect_on_start"] = self.connect_on_start.get_active()
+        save_config(cfg)
+        set_autostart(self.autostart.get_active())
+
+
+def gateway_choices(cfg):
+    names = list(cfg.get("known_gateways", []))
+    if cfg["gateway"] and cfg["gateway"] not in names:
+        names.append(cfg["gateway"])
+    return sorted(names, key=str.lower)
+
+
+def remember_gateway(cfg, name):
+    if name and name not in cfg.setdefault("known_gateways", []):
+        cfg["known_gateways"].append(name)
+
+
+def set_autostart(enabled):
+    if enabled:
+        os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+        exe = shutil.which("gpconnect-tray") or os.path.abspath(sys.argv[0])
+        with open(AUTOSTART_FILE, "w") as f:
+            f.write(AUTOSTART_DESKTOP.format(exec=exe))
+    elif os.path.exists(AUTOSTART_FILE):
+        os.remove(AUTOSTART_FILE)
+
+
+class TrayApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.config = load_config()
+        self.state = DISCONNECTED
+        self.external = False  # tunnel brought up outside of this app
+        self.auth_proc = None
+        self.helper_proc = None
+        self.user_cancelled = False
+        self.quitting = False
+        self.log_lines = collections.deque(maxlen=3000)
+        self.last_error = ""
+        self.log_window = None
+        self.settings_dialog = None
+        self.notification = None
+        self.started = False
+
+    # ---------- lifecycle ----------
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        Notify.init(APP_NAME)
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        try:  # keep the log file from growing without bound
+            if os.path.getsize(LOG_FILE) > 2_000_000:
+                os.replace(LOG_FILE, LOG_FILE + ".old")
+        except OSError:
+            pass
+        self.hold()
+        self._build_indicator()
+        self._set_state(DISCONNECTED)
+        GLib.timeout_add_seconds(3, self._poll)
+        self._poll()
+
+    def do_activate(self):
+        if not self.started:
+            self.started = True
+            if self.config["connect_on_start"] and self.state == DISCONNECTED:
+                GLib.idle_add(self.connect_vpn)
+        else:
+            # Launched again while already running: open settings.
+            self.show_settings()
+
+    # ---------- UI ----------
+    def _build_indicator(self):
+        self.indicator = AppIndicator.Indicator.new(
+            "gpconnect-tray", "network-vpn", AppIndicator.IndicatorCategory.COMMUNICATIONS)
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_title(APP_NAME)
+
+        menu = Gtk.Menu()
+        self.status_item = Gtk.MenuItem(label="")
+        self.status_item.set_sensitive(False)
+        menu.append(self.status_item)
+        self.portal_item = Gtk.MenuItem(label="")
+        self.portal_item.set_sensitive(False)
+        menu.append(self.portal_item)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        self.toggle_item = Gtk.MenuItem(label="Connect")
+        self.toggle_item.connect("activate", lambda *_: self.toggle())
+        menu.append(self.toggle_item)
+        self.gateway_item = Gtk.MenuItem(label="Gateway")
+        menu.append(self.gateway_item)
+        self._build_gateway_menu()
+        menu.append(Gtk.SeparatorMenuItem())
+
+        log_item = Gtk.MenuItem(label="Show Log…")
+        log_item.connect("activate", lambda *_: self.show_log())
+        menu.append(log_item)
+        settings_item = Gtk.MenuItem(label="Settings…")
+        settings_item.connect("activate", lambda *_: self.show_settings())
+        menu.append(settings_item)
+        menu.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda *_: self.quit_app())
+        menu.append(quit_item)
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+        self.indicator.set_secondary_activate_target(self.toggle_item)
+
+    def _build_gateway_menu(self):
+        sub = Gtk.Menu()
+        group = []
+        current = self.config["gateway"]
+        for name in ["", *gateway_choices(self.config)]:
+            item = Gtk.RadioMenuItem.new_with_label(group, name or "Automatic")
+            group = item.get_group()
+            item.set_active(name == current)
+            item.connect("toggled", self._on_gateway_toggled, name)
+            sub.append(item)
+        sub.append(Gtk.SeparatorMenuItem())
+        other = Gtk.MenuItem(label="Other…")
+        other.connect("activate", lambda *_: self.show_settings())
+        sub.append(other)
+        sub.show_all()
+        self.gateway_item.set_submenu(sub)
+        self.gateway_item.set_label(f"Gateway: {current or 'Automatic'}")
+
+    def _on_gateway_toggled(self, item, name):
+        if not item.get_active() or name == self.config["gateway"]:
+            return
+        self.config["gateway"] = name
+        save_config(self.config)
+        self.gateway_item.set_label(f"Gateway: {name or 'Automatic'}")
+        if self.state in (CONNECTED, CONNECTING):
+            self.notify("Gateway changed", f"{name or 'Automatic'} will be used the next time you connect.")
+
+    def _set_state(self, state):
+        prev, self.state = self.state, state
+        label, icons = STATE_INFO[state]
+        icon = first_icon(icons)
+        self.indicator.set_icon_full(icon, f"VPN {label}")
+        self.indicator.set_title(f"{APP_NAME}: {label}")
+        self.status_item.set_label(f"VPN: {label}")
+        self.portal_item.set_label(self._portal_host())
+
+        toggle_label = {
+            DISCONNECTED: "Connect",
+            AUTHENTICATING: "Cancel",
+            CONNECTING: "Cancel",
+            CONNECTED: "Disconnect",
+            DISCONNECTING: "Disconnecting…",
+        }[state]
+        self.toggle_item.set_label(toggle_label)
+        self.toggle_item.set_sensitive(state != DISCONNECTING)
+        self.gateway_item.set_sensitive(state == DISCONNECTED)
+
+        if prev != state:
+            if state == CONNECTED:
+                self.notify("VPN connected", f"Connected to {self._portal_host()}", icon)
+            elif state == DISCONNECTED and prev in (CONNECTED, DISCONNECTING):
+                self.notify("VPN disconnected", f"Disconnected from {self._portal_host()}", icon)
+
+    def _portal_host(self):
+        portal = self.config["portal"]
+        return re.sub(r"^https?://", "", portal).rstrip("/") or "No portal configured"
+
+    def notify(self, summary, body="", icon="network-vpn"):
+        try:
+            if self.notification is None:
+                self.notification = Notify.Notification.new(summary, body, icon)
+            else:
+                self.notification.update(summary, body, icon)
+            self.notification.set_hint("desktop-entry", GLib.Variant("s", "gpconnect-tray"))
+            self.notification.show()
+        except GLib.Error:
+            pass
+
+    def show_log(self):
+        if self.log_window is None:
+            self.log_window = LogWindow(self)
+            self.log_window.set_text("\n".join(self.log_lines))
+        self.log_window.show_all()
+        self.log_window.present()
+
+    def clear_log(self):
+        self.log_lines.clear()
+        if self.log_window:
+            self.log_window.set_text("")
+
+    def show_settings(self):
+        if self.settings_dialog:
+            self.settings_dialog.present()
+            return
+        dlg = self.settings_dialog = SettingsDialog(self)
+        dlg.present()
+
+        def on_response(d, resp):
+            if resp == Gtk.ResponseType.OK:
+                d.apply()
+                self.portal_item.set_label(self._portal_host())
+                self._build_gateway_menu()
+            d.destroy()
+            self.settings_dialog = None
+
+        dlg.connect("response", on_response)
+
+    def log(self, line):
+        line = strip_ansi(line.rstrip("\n"))
+        if not line:
+            return
+        self.log_lines.append(line)
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+        m = GATEWAY_RE.search(line)
+        if m and m.group(1) not in self.config["known_gateways"]:
+            remember_gateway(self.config, m.group(1))
+            save_config(self.config)
+            self._build_gateway_menu()
+        if self.log_window:
+            self.log_window.append(line)
+        if re.search(r"\b(ERROR|error|failed|Failed)\b", line):
+            self.last_error = re.sub(r"^\[[^\]]*\]\s*", "", line)
+
+    # ---------- connection logic ----------
+    def toggle(self):
+        if self.state == DISCONNECTED:
+            self.connect_vpn()
+        elif self.state in (AUTHENTICATING, CONNECTING, CONNECTED):
+            self.disconnect_vpn()
+
+    def connect_vpn(self):
+        cfg = self.config
+        if not cfg["portal"]:
+            self.show_settings()
+            return
+        if not os.path.exists(HELPER):
+            self.notify("Helper not installed", "Run install.sh to install the privileged helper.", "dialog-error")
+            return
+        if tunnel_is_up():
+            self.external = True
+            self._set_state(CONNECTED)
+            return
+
+        self.user_cancelled = False
+        self.last_error = ""
+        self.external = False
+        cmd = ["gpauth"]
+        if cfg["fix_openssl"]:
+            cmd.append("--fix-openssl")
+        if cfg["browser"] != "embedded":
+            cmd.append(f"--browser={cfg['browser']}")
+        cmd.append(cfg["portal"])
+
+        self.log(f"$ {' '.join(cmd)}")
+        try:
+            self.auth_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                              stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            self.log(f"Failed to start gpauth: {e}")
+            self.notify("Could not start sign-in", str(e), "dialog-error")
+            return
+        self._set_state(AUTHENTICATING)
+        threading.Thread(target=self._auth_worker, args=(self.auth_proc,), daemon=True).start()
+
+    def _auth_worker(self, proc):
+        stderr_thread = threading.Thread(
+            target=lambda: [GLib.idle_add(self.log, l.decode(errors="replace")) for l in proc.stderr],
+            daemon=True)
+        stderr_thread.start()
+        auth_data = proc.stdout.read()
+        code = proc.wait()
+        stderr_thread.join(timeout=2)
+        GLib.idle_add(self._auth_done, proc, code, auth_data)
+
+    def _auth_done(self, proc, code, auth_data):
+        if proc is not self.auth_proc:
+            return
+        self.auth_proc = None
+        if self.user_cancelled or self.quitting:
+            self.log("Sign-in cancelled.")
+            self._set_state(DISCONNECTED)
+            return
+        if code != 0 or not auth_data.strip():
+            self.log(f"gpauth exited with status {code}")
+            self._set_state(DISCONNECTED)
+            self.notify("Sign-in failed", self.last_error or f"gpauth exited with status {code}", "dialog-error")
+            return
+        self._start_tunnel(auth_data.strip())
+
+    def _start_tunnel(self, auth_data):
+        cfg = self.config
+        args = [cfg["portal"]]
+        if cfg["fix_openssl"]:
+            args.append("--fix-openssl")
+        if cfg["disable_ipv6"]:
+            args.append("--disable-ipv6")
+        if cfg["browser"] != "embedded":
+            # gpclient runs a second SAML login for the gateway; use the same browser.
+            args.append(f"--browser={cfg['browser']}")
+        if cfg["gateway"]:
+            args += ["--gateway", cfg["gateway"]]
+        else:
+            args.append("--auto-gateway")
+
+        cmd = ["pkexec", HELPER, *args]
+        self.log(f"$ {' '.join(cmd)}")
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, start_new_session=True)
+            proc.stdin.write(base64.b64encode(auth_data) + b"\n")
+            proc.stdin.flush()
+        except (OSError, BrokenPipeError) as e:
+            self.log(f"Failed to start helper: {e}")
+            self._set_state(DISCONNECTED)
+            self.notify("Could not connect", str(e), "dialog-error")
+            return
+        self.helper_proc = proc
+        self._set_state(CONNECTING)
+        threading.Thread(target=self._helper_worker, args=(proc,), daemon=True).start()
+
+    def _helper_worker(self, proc):
+        for raw in proc.stdout:
+            line = raw.decode(errors="replace")
+            GLib.idle_add(self._helper_line, proc, line)
+        code = proc.wait()
+        GLib.idle_add(self._helper_done, proc, code)
+
+    def _helper_line(self, proc, line):
+        self.log(line)
+        if proc is self.helper_proc and self.state == CONNECTING and CONNECTED_RE.search(line):
+            self._set_state(CONNECTED)
+
+    def _helper_done(self, proc, code):
+        if proc is not self.helper_proc:
+            return
+        self.helper_proc = None
+        self.log(f"VPN process exited with status {code}")
+        was = self.state
+        self._set_state(DISCONNECTED)
+        if self.quitting:
+            self.quit()
+            return
+        if self.user_cancelled:
+            return
+        if code == 126:
+            self.notify("Authorization cancelled", "The VPN was not started.", "dialog-warning")
+        elif code == 127:
+            self.notify("Not authorized", "You are not allowed to start the VPN.", "dialog-error")
+        elif was != CONNECTED or code != 0:
+            self.notify("VPN connection failed" if was != CONNECTED else "VPN connection lost",
+                        self.last_error or f"gpclient exited with status {code}. See the log for details.",
+                        "dialog-error")
+
+    def disconnect_vpn(self):
+        self.user_cancelled = True
+        if self.auth_proc:
+            try:
+                os.killpg(self.auth_proc.pid, 15)
+            except ProcessLookupError:
+                pass
+            return
+        if self.helper_proc:
+            self._set_state(DISCONNECTING)
+            try:
+                self.helper_proc.stdin.write(b"disconnect\n")
+                self.helper_proc.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            return
+        if self.external or tunnel_is_up():
+            # Tunnel started elsewhere (e.g. from a terminal): ask gpclient to stop it.
+            self._set_state(DISCONNECTING)
+            self.log("$ pkexec gpclient disconnect")
+
+            def worker():
+                r = subprocess.run(["pkexec", "/usr/bin/gpclient", "disconnect", "--wait", "15"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                GLib.idle_add(self.log, r.stdout.decode(errors="replace"))
+                GLib.idle_add(self._poll)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    def _poll(self):
+        up = tunnel_is_up()
+        if self.helper_proc is None and self.auth_proc is None:
+            if up and self.state != CONNECTED:
+                self.external = True
+                self._set_state(CONNECTED)
+            elif not up and self.state in (CONNECTED, DISCONNECTING):
+                self.external = False
+                self._set_state(DISCONNECTED)
+        elif self.helper_proc and up and self.state == CONNECTING:
+            self._set_state(CONNECTED)
+        return True
+
+    def quit_app(self):
+        if self.helper_proc:
+            self.quitting = True
+            self.disconnect_vpn()
+            GLib.timeout_add_seconds(25, self.quit)  # fallback
+        else:
+            if self.auth_proc:
+                self.quitting = True
+                self.disconnect_vpn()
+            self.quit()
+
+
+def main():
+    GLib.set_prgname("gpconnect-tray")
+    GLib.set_application_name(APP_NAME)
+    app = TrayApp()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

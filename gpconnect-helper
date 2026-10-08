@@ -1,0 +1,112 @@
+#!/usr/bin/python3 -I
+"""Privileged helper for gpconnect-tray, launched through pkexec.
+
+Protocol:
+  argv:   gpconnect-helper <portal> [--disable-ipv6] [--fix-openssl]
+                                    [--gateway NAME | --auto-gateway]
+                                    [--browser=NAME]
+  stdin:  first line is the base64-encoded gpauth output. After that the
+          helper keeps reading stdin; a "disconnect" line or EOF (the tray
+          exited) makes it stop the VPN.
+  stdout: gpclient's output, line by line.
+
+Arguments are validated strictly because this runs as root.
+"""
+
+import base64
+import re
+import signal
+import subprocess
+import sys
+import threading
+
+GPCLIENT = "/usr/bin/gpclient"
+PORTAL_RE = re.compile(r"^(https?://)?[A-Za-z0-9][A-Za-z0-9.-]*(:\d+)?(/[A-Za-z0-9._~/-]*)?$")
+BROWSER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+GATEWAY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,127}$")
+
+
+def die(msg, code=2):
+    print(f"gpconnect-helper: {msg}", flush=True)
+    sys.exit(code)
+
+
+def parse_args(argv):
+    if not argv:
+        die("missing portal")
+    portal, rest = argv[0], argv[1:]
+    if not PORTAL_RE.match(portal):
+        die(f"invalid portal: {portal!r}")
+
+    global_opts, connect_opts = [], []
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "--fix-openssl":
+            global_opts.append(arg)
+        elif arg in ("--disable-ipv6", "--auto-gateway"):
+            connect_opts.append(arg)
+        elif arg.startswith("--browser="):
+            if not BROWSER_RE.match(arg.split("=", 1)[1]):
+                die(f"invalid browser: {arg!r}")
+            connect_opts.append(arg)
+        elif arg == "--gateway" and i + 1 < len(rest):
+            i += 1
+            if not GATEWAY_RE.match(rest[i]):
+                die(f"invalid gateway: {rest[i]!r}")
+            connect_opts += ["--gateway", rest[i]]
+        else:
+            die(f"unsupported argument: {arg!r}")
+        i += 1
+
+    return [GPCLIENT, *global_opts, "connect", *connect_opts, "--cookie-on-stdin", portal]
+
+
+def main():
+    cmd = parse_args(sys.argv[1:])
+
+    first = sys.stdin.buffer.readline().strip()
+    try:
+        auth = base64.b64decode(first, validate=True)
+    except ValueError:
+        die("invalid auth data")
+    if not auth:
+        die("empty auth data")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    proc.stdin.write(auth if auth.endswith(b"\n") else auth + b"\n")
+    proc.stdin.close()
+
+    def stop():
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def watch_stdin():
+        for line in sys.stdin:
+            if line.strip() == "disconnect":
+                break
+        stop()
+
+    threading.Thread(target=watch_stdin, daemon=True).start()
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop())
+
+    for raw in proc.stdout:
+        sys.stdout.write(raw.decode(errors="replace"))
+        sys.stdout.flush()
+
+    sys.exit(proc.wait())
+
+
+if __name__ == "__main__":
+    main()
