@@ -49,6 +49,8 @@ DEFAULT_CONFIG = {
     "browser": "microsoft-edge-stable",
     "gateway": "",  # empty = automatic
     "known_gateways": [],
+    "gateway_hosts": {},  # gateway name -> address, learned from gpclient output
+    "direct_gateway": True,  # skip the portal sign-in when the gateway address is known
     "disable_ipv6": True,
     "fix_openssl": True,
     "connect_on_start": False,
@@ -74,6 +76,7 @@ X-GNOME-Autostart-Delay=5
 NoDisplay=false
 """
 
+SIGNED_IN_RE = re.compile(r"Received the browser authentication data|Perform gateway login")
 CONNECTED_RE = re.compile(r"Connected to VPN|Wrote PID \d+ to .*gpclient\.lock")
 GATEWAY_RE = re.compile(r"Connecting to the selected gateway: (.+?) \(([^)]+)\)\s*$")
 
@@ -89,7 +92,7 @@ STATE_INFO = {
 
 
 def load_config():
-    cfg = dict(DEFAULT_CONFIG)
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
     try:
         with open(CONFIG_FILE) as f:
             cfg.update(json.load(f))
@@ -208,6 +211,7 @@ class SettingsDialog(Gtk.Dialog):
 
         self.disable_ipv6 = Gtk.Switch(active=cfg["disable_ipv6"], valign=Gtk.Align.CENTER)
         self.fix_openssl = Gtk.Switch(active=cfg["fix_openssl"], valign=Gtk.Align.CENTER)
+        self.direct_gateway = Gtk.Switch(active=cfg["direct_gateway"], valign=Gtk.Align.CENTER)
         self.connect_on_start = Gtk.Switch(active=cfg["connect_on_start"], valign=Gtk.Align.CENTER)
         self.autostart = Gtk.Switch(active=os.path.exists(AUTOSTART_FILE), valign=Gtk.Align.CENTER)
 
@@ -219,6 +223,8 @@ class SettingsDialog(Gtk.Dialog):
         box.pack_start(self._group("Options", [
             ("Disable IPv6", "Do not request IPv6 connectivity", self.disable_ipv6),
             ("OpenSSL compatibility mode", "Equivalent to --fix-openssl", self.fix_openssl),
+            ("Skip portal sign-in", "Connect straight to the chosen gateway: one sign-in instead of two",
+             self.direct_gateway),
         ]), False, False, 0)
         box.pack_start(self._group("Startup", [
             ("Start at login", "Show the tray icon when you log in", self.autostart),
@@ -270,6 +276,7 @@ class SettingsDialog(Gtk.Dialog):
         cfg["disable_ipv6"] = self.disable_ipv6.get_active()
         cfg["fix_openssl"] = self.fix_openssl.get_active()
         cfg["connect_on_start"] = self.connect_on_start.get_active()
+        cfg["direct_gateway"] = self.direct_gateway.get_active()
         save_config(cfg)
         set_autostart(self.autostart.get_active())
 
@@ -305,6 +312,7 @@ class TrayApp(Gtk.Application):
         self.auth_proc = None
         self.helper_proc = None
         self.user_cancelled = False
+        self.direct = False
         self.quitting = False
         self.log_lines = collections.deque(maxlen=3000)
         self.last_error = ""
@@ -485,10 +493,13 @@ class TrayApp(Gtk.Application):
         except OSError:
             pass
         m = GATEWAY_RE.search(line)
-        if m and m.group(1) not in self.config["known_gateways"]:
+        if m and self.config["gateway_hosts"].get(m.group(1)) != m.group(2):
+            new = m.group(1) not in self.config["known_gateways"]
             remember_gateway(self.config, m.group(1))
+            self.config["gateway_hosts"][m.group(1)] = m.group(2)
             save_config(self.config)
-            self._build_gateway_menu()
+            if new:
+                self._build_gateway_menu()
         if self.log_window:
             self.log_window.append(line)
         if re.search(r"\b(ERROR|error|failed|Failed)\b", line):
@@ -517,6 +528,13 @@ class TrayApp(Gtk.Application):
         self.user_cancelled = False
         self.last_error = ""
         self.external = False
+
+        host = cfg["gateway_hosts"].get(cfg["gateway"]) if cfg["gateway"] else None
+        if cfg["direct_gateway"] and host:
+            # gpclient does the (single) gateway SAML sign-in itself.
+            self._start_tunnel(b"", direct_host=host)
+            return
+
         cmd = ["gpauth"]
         if cfg["fix_openssl"]:
             cmd.append("--fix-openssl")
@@ -560,17 +578,20 @@ class TrayApp(Gtk.Application):
             return
         self._start_tunnel(auth_data.strip())
 
-    def _start_tunnel(self, auth_data):
+    def _start_tunnel(self, auth_data, direct_host=None):
         cfg = self.config
-        args = [cfg["portal"]]
+        self.direct = bool(direct_host)
+        args = [direct_host, "--as-gateway"] if direct_host else [cfg["portal"]]
         if cfg["fix_openssl"]:
             args.append("--fix-openssl")
         if cfg["disable_ipv6"]:
             args.append("--disable-ipv6")
         if cfg["browser"] != "embedded":
-            # gpclient runs a second SAML login for the gateway; use the same browser.
+            # gpclient runs the gateway SAML login itself; use the same browser.
             args.append(f"--browser={cfg['browser']}")
-        if cfg["gateway"]:
+        if direct_host:
+            pass
+        elif cfg["gateway"]:
             args += ["--gateway", cfg["gateway"]]
         else:
             args.append("--auto-gateway")
@@ -588,7 +609,7 @@ class TrayApp(Gtk.Application):
             self.notify("Could not connect", str(e), "dialog-error")
             return
         self.helper_proc = proc
-        self._set_state(CONNECTING)
+        self._set_state(AUTHENTICATING if direct_host else CONNECTING)
         threading.Thread(target=self._helper_worker, args=(proc,), daemon=True).start()
 
     def _helper_worker(self, proc):
@@ -600,7 +621,11 @@ class TrayApp(Gtk.Application):
 
     def _helper_line(self, proc, line):
         self.log(line)
-        if proc is self.helper_proc and self.state == CONNECTING and CONNECTED_RE.search(line):
+        if proc is not self.helper_proc:
+            return
+        if self.state == AUTHENTICATING and SIGNED_IN_RE.search(line):
+            self._set_state(CONNECTING)
+        if self.state in (AUTHENTICATING, CONNECTING) and CONNECTED_RE.search(line):
             self._set_state(CONNECTED)
 
     def _helper_done(self, proc, code):
@@ -620,9 +645,10 @@ class TrayApp(Gtk.Application):
         elif code == 127:
             self.notify("Not authorized", "You are not allowed to start the VPN.", "dialog-error")
         elif was != CONNECTED or code != 0:
-            self.notify("VPN connection failed" if was != CONNECTED else "VPN connection lost",
-                        self.last_error or f"gpclient exited with status {code}. See the log for details.",
-                        "dialog-error")
+            body = self.last_error or f"gpclient exited with status {code}. See the log for details."
+            if was != CONNECTED and self.direct:
+                body += "\nIf this keeps happening, turn off “Skip portal sign-in” in Settings."
+            self.notify("VPN connection failed" if was != CONNECTED else "VPN connection lost", body, "dialog-error")
 
     def disconnect_vpn(self):
         self.user_cancelled = True
@@ -643,10 +669,10 @@ class TrayApp(Gtk.Application):
         if self.external or tunnel_is_up():
             # Tunnel started elsewhere (e.g. from a terminal): ask gpclient to stop it.
             self._set_state(DISCONNECTING)
-            self.log("$ pkexec gpclient disconnect")
+            self.log(f"$ pkexec {HELPER} --disconnect")
 
             def worker():
-                r = subprocess.run(["pkexec", "/usr/bin/gpclient", "disconnect", "--wait", "15"],
+                r = subprocess.run(["pkexec", HELPER, "--disconnect"],
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                 GLib.idle_add(self.log, r.stdout.decode(errors="replace"))
                 GLib.idle_add(self._poll)
@@ -662,7 +688,7 @@ class TrayApp(Gtk.Application):
             elif not up and self.state in (CONNECTED, DISCONNECTING):
                 self.external = False
                 self._set_state(DISCONNECTED)
-        elif self.helper_proc and up and self.state == CONNECTING:
+        elif self.helper_proc and up and self.state in (AUTHENTICATING, CONNECTING):
             self._set_state(CONNECTED)
         return True
 

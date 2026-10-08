@@ -2,10 +2,12 @@
 """Privileged helper for gpconnect-tray, launched through pkexec.
 
 Protocol:
-  argv:   gpconnect-helper <portal> [--disable-ipv6] [--fix-openssl]
+  argv:   gpconnect-helper <server> [--disable-ipv6] [--fix-openssl] [--as-gateway]
                                     [--gateway NAME | --auto-gateway]
                                     [--browser=NAME]
-  stdin:  first line is the base64-encoded gpauth output. After that the
+          gpconnect-helper --disconnect
+  stdin:  first line is the base64-encoded gpauth output, or empty to let
+          gpclient run the SAML sign-in itself. After that the
           helper keeps reading stdin; a "disconnect" line or EOF (the tray
           exited) makes it stop the VPN.
   stdout: gpclient's output, line by line.
@@ -32,6 +34,8 @@ def die(msg, code=2):
 
 
 def parse_args(argv):
+    if argv == ["--disconnect"]:
+        return [GPCLIENT, "disconnect", "--wait", "15"]
     if not argv:
         die("missing portal")
     portal, rest = argv[0], argv[1:]
@@ -44,7 +48,7 @@ def parse_args(argv):
         arg = rest[i]
         if arg == "--fix-openssl":
             global_opts.append(arg)
-        elif arg in ("--disable-ipv6", "--auto-gateway"):
+        elif arg in ("--disable-ipv6", "--auto-gateway", "--as-gateway"):
             connect_opts.append(arg)
         elif arg.startswith("--browser="):
             if not BROWSER_RE.match(arg.split("=", 1)[1]):
@@ -59,29 +63,32 @@ def parse_args(argv):
             die(f"unsupported argument: {arg!r}")
         i += 1
 
-    return [GPCLIENT, *global_opts, "connect", *connect_opts, "--cookie-on-stdin", portal]
+    return [GPCLIENT, *global_opts, "connect", *connect_opts, portal]
 
 
 def main():
     cmd = parse_args(sys.argv[1:])
+    if cmd[1] == "disconnect":
+        sys.exit(subprocess.call(cmd))
 
     first = sys.stdin.buffer.readline().strip()
     try:
         auth = base64.b64decode(first, validate=True)
     except ValueError:
         die("invalid auth data")
-    if not auth:
-        die("empty auth data")
+    if auth:
+        cmd.insert(-1, "--cookie-on-stdin")
 
     proc = subprocess.Popen(
         cmd,
-        stdin=subprocess.PIPE,
+        stdin=subprocess.PIPE if auth else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
-    proc.stdin.write(auth if auth.endswith(b"\n") else auth + b"\n")
-    proc.stdin.close()
+    if auth:
+        proc.stdin.write(auth if auth.endswith(b"\n") else auth + b"\n")
+        proc.stdin.close()
 
     def stop():
         if proc.poll() is None:
