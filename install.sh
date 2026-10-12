@@ -26,6 +26,12 @@ sed "s/@ALLOW_ACTIVE@/$ALLOW_ACTIVE/" io.github.gpconnect-tray.policy |
 
 echo "==> Installing tray app for $USER"
 install -Dm755 gpconnect-tray "$HOME/.local/bin/gpconnect-tray"
+ICON_DIR="$HOME/.local/share/icons/hicolor"
+install -Dm644 -t "$ICON_DIR/scalable/status" icons/gpconnect-tray-*.svg
+# A stale icon cache hides newly added icons from GTK.
+if [[ -f "$ICON_DIR/icon-theme.cache" ]] && command -v gtk-update-icon-cache >/dev/null; then
+  gtk-update-icon-cache -q -f -t "$ICON_DIR"
+fi
 install -Dm644 gpconnect-tray.desktop "$HOME/.local/share/applications/gpconnect-tray.desktop"
 sed -i "s|^Exec=.*|Exec=$HOME/.local/bin/gpconnect-tray|" "$HOME/.local/share/applications/gpconnect-tray.desktop"
 

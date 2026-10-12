@@ -82,12 +82,14 @@ GATEWAY_RE = re.compile(r"Connecting to the selected gateway: (.+?) \(([^)]+)\)\
 
 DISCONNECTED, AUTHENTICATING, CONNECTING, CONNECTED, DISCONNECTING = range(5)
 
+# The app's own full-colour icons come first (installed into hicolor by install.sh),
+# so the state reads the same on any panel; theme VPN icons are the fallback.
 STATE_INFO = {
-    DISCONNECTED: ("Disconnected", ["network-vpn-disconnected-symbolic", "network-vpn-disabled-symbolic", "network-vpn"]),
-    AUTHENTICATING: ("Waiting for sign-in…", ["network-vpn-acquiring-symbolic", "network-vpn-acquiring", "network-vpn"]),
-    CONNECTING: ("Connecting…", ["network-vpn-acquiring-symbolic", "network-vpn-acquiring", "network-vpn"]),
-    CONNECTED: ("Connected", ["network-vpn-symbolic", "network-vpn"]),
-    DISCONNECTING: ("Disconnecting…", ["network-vpn-acquiring-symbolic", "network-vpn-acquiring", "network-vpn"]),
+    DISCONNECTED: ("Disconnected", ["gpconnect-tray-disconnected", "network-vpn-disconnected-symbolic", "network-vpn-disabled-symbolic", "network-vpn"]),
+    AUTHENTICATING: ("Waiting for sign-in…", ["gpconnect-tray-connecting", "network-vpn-acquiring-symbolic", "network-vpn-acquiring", "network-vpn"]),
+    CONNECTING: ("Connecting…", ["gpconnect-tray-connecting", "network-vpn-acquiring-symbolic", "network-vpn-acquiring", "network-vpn"]),
+    CONNECTED: ("Connected", ["gpconnect-tray-connected", "network-vpn-symbolic", "network-vpn"]),
+    DISCONNECTING: ("Disconnecting…", ["gpconnect-tray-connecting", "network-vpn-acquiring-symbolic", "network-vpn-acquiring", "network-vpn"]),
 }
 
 

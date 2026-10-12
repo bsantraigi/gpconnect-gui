@@ -1,8 +1,10 @@
 # gpconnect-tray
 
 A small system-tray front end for [GlobalProtect-openconnect](https://github.com/yuezk/GlobalProtect-openconnect)
-(`gpclient` / `gpauth`). Uses GTK 3, AppIndicator and your icon theme's standard VPN
-icons, so it blends into GNOME (Ubuntu), Cinnamon/MATE/Xfce (Linux Mint) and KDE.
+(`gpclient` / `gpauth`). Uses GTK 3 and AppIndicator, so it works in GNOME (Ubuntu),
+Cinnamon/MATE/Xfce (Linux Mint), KDE and plain XEmbed trays such as polybar. The tray
+icon is a full-colour shield (green connected, amber connecting, grey disconnected)
+that stays legible on dark and light panels regardless of the icon theme.
 
 ## Install
 
