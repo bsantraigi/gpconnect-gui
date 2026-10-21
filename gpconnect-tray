@@ -44,6 +44,13 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 AUTOSTART_FILE = os.path.join(GLib.get_user_config_dir(), "autostart", "gpconnect-tray.desktop")
 LOG_FILE = os.path.join(GLib.get_user_cache_dir(), "gpconnect-tray", "gpconnect.log")
 
+# The browser hands the SAML result back through a globalprotectcallback: URL,
+# which xdg-open dispatches to gpgui.desktop (`gpclient launch-gui %u`).
+CALLBACK_DESKTOP = "gpgui.desktop"
+SYSTEM_CALLBACK_DESKTOP = os.path.join("/usr/share/applications", CALLBACK_DESKTOP)
+USER_CALLBACK_DESKTOP = os.path.join(GLib.get_user_data_dir(), "applications", CALLBACK_DESKTOP)
+SIGN_IN_REMINDER_SECS = 120
+
 DEFAULT_CONFIG = {
     "portal": "",
     "browser": "microsoft-edge-stable",
@@ -120,6 +127,64 @@ def tunnel_is_up():
             return f.read().strip().startswith("gpclient")
     except (OSError, ValueError):
         return False
+
+
+def ensure_callback_handler():
+    """Make sure xdg-open can launch the globalprotectcallback: handler.
+
+    GlobalProtect-openconnect 3.x ships `Exec="/usr/bin/gpclient" launch-gui %u`.
+    Outside GNOME/KDE, xdg-open (xdg-utils 1.1.x, generic mode) runs that path
+    with the quotes still on and fails with "Permission denied", so the browser
+    never hands the sign-in result back and gpauth waits forever. A user-level
+    copy with the same desktop ID and an unquoted Exec fixes it and survives
+    package upgrades. Returns a message when it changed something.
+    """
+    try:
+        with open(SYSTEM_CALLBACK_DESKTOP) as f:
+            system = f.read()
+    except OSError:
+        return None
+    fixed = re.sub(r'^Exec="([^"]+)"', r"Exec=\1", system, flags=re.M)
+    if fixed == system:
+        # Packaged file is fine; drop a stale override we created earlier.
+        try:
+            with open(USER_CALLBACK_DESKTOP) as f:
+                if "X-GPConnect-Tray-Override=true" in f.read():
+                    os.remove(USER_CALLBACK_DESKTOP)
+                    return f"Removed {USER_CALLBACK_DESKTOP} (no longer needed)"
+        except OSError:
+            pass
+        return None
+    fixed = fixed.rstrip("\n") + "\n# Written by gpconnect-tray: unquoted Exec for xdg-open.\nX-GPConnect-Tray-Override=true\n"
+    try:
+        with open(USER_CALLBACK_DESKTOP) as f:
+            current = f.read()
+    except OSError:
+        current = None
+    if current == fixed:
+        return None
+    if current is not None and "X-GPConnect-Tray-Override=true" not in current:
+        return None  # the user's own override: leave it alone
+    os.makedirs(os.path.dirname(USER_CALLBACK_DESKTOP), exist_ok=True)
+    with open(USER_CALLBACK_DESKTOP, "w") as f:
+        f.write(fixed)
+    subprocess.run(["update-desktop-database", os.path.dirname(USER_CALLBACK_DESKTOP)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return f"Wrote {USER_CALLBACK_DESKTOP} so the browser can return the sign-in to gpauth"
+
+
+def parse_auth_output(data):
+    """gpauth 3.x prints {"success": ...} or {"failure": "..."} (exit status 0 either way).
+
+    Returns an error message, or None if the data looks usable.
+    """
+    try:
+        obj = json.loads(data)
+    except ValueError:
+        return None  # older/plain formats: let gpclient decide
+    if isinstance(obj, dict) and "failure" in obj:
+        return str(obj["failure"]) or "Sign-in failed"
+    return None
 
 
 def first_icon(names):
@@ -322,6 +387,7 @@ class TrayApp(Gtk.Application):
         self.settings_dialog = None
         self.notification = None
         self.started = False
+        self.reminder_id = 0
 
     # ---------- lifecycle ----------
     def do_startup(self):
@@ -416,6 +482,11 @@ class TrayApp(Gtk.Application):
 
     def _set_state(self, state):
         prev, self.state = self.state, state
+        if state == AUTHENTICATING and prev != AUTHENTICATING:
+            self._cancel_reminder()
+            self.reminder_id = GLib.timeout_add_seconds(SIGN_IN_REMINDER_SECS, self._sign_in_reminder)
+        elif state != AUTHENTICATING:
+            self._cancel_reminder()
         label, icons = STATE_INFO[state]
         icon = first_icon(icons)
         self.indicator.set_icon_full(icon, f"VPN {label}")
@@ -439,6 +510,21 @@ class TrayApp(Gtk.Application):
                 self.notify("VPN connected", f"Connected to {self._portal_host()}", icon)
             elif state == DISCONNECTED and prev in (CONNECTED, DISCONNECTING):
                 self.notify("VPN disconnected", f"Disconnected from {self._portal_host()}", icon)
+
+    def _cancel_reminder(self):
+        if self.reminder_id:
+            GLib.source_remove(self.reminder_id)
+            self.reminder_id = 0
+
+    def _sign_in_reminder(self):
+        self.reminder_id = 0
+        if self.state == AUTHENTICATING:
+            self.log("Still waiting for the browser to hand back the sign-in (globalprotectcallback:).")
+            self.notify("Still waiting for sign-in",
+                        "Finish signing in in the browser. If it already says “Authentication Complete”, "
+                        "click the “click here” link on that page, or Cancel and try again.",
+                        "dialog-warning")
+        return False
 
     def _portal_host(self):
         portal = self.config["portal"]
@@ -531,6 +617,13 @@ class TrayApp(Gtk.Application):
         self.last_error = ""
         self.external = False
 
+        try:
+            msg = ensure_callback_handler()
+            if msg:
+                self.log(msg)
+        except OSError as e:
+            self.log(f"Could not check the {CALLBACK_DESKTOP} URL handler: {e}")
+
         host = cfg["gateway_hosts"].get(cfg["gateway"]) if cfg["gateway"] else None
         if cfg["direct_gateway"] and host:
             # gpclient does the (single) gateway SAML sign-in itself.
@@ -577,6 +670,12 @@ class TrayApp(Gtk.Application):
             self.log(f"gpauth exited with status {code}")
             self._set_state(DISCONNECTED)
             self.notify("Sign-in failed", self.last_error or f"gpauth exited with status {code}", "dialog-error")
+            return
+        failure = parse_auth_output(auth_data.strip())
+        if failure:
+            self.log(f"gpauth: {failure}")
+            self._set_state(DISCONNECTED)
+            self.notify("Sign-in failed", failure, "dialog-error")
             return
         self._start_tunnel(auth_data.strip())
 

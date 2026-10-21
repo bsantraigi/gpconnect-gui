@@ -6,6 +6,9 @@ rm -f "$HOME/.local/bin/gpconnect-tray" \
       "$HOME/.local/share/applications/gpconnect-tray.desktop" \
       "$HOME/.config/autostart/gpconnect-tray.desktop" \
       "$HOME"/.local/share/icons/hicolor/scalable/status/gpconnect-tray-*.svg
+# Callback-handler override written by the tray (only if it is ours).
+GPGUI="$HOME/.local/share/applications/gpgui.desktop"
+if grep -q '^X-GPConnect-Tray-Override=true' "$GPGUI" 2>/dev/null; then rm -f "$GPGUI"; fi
 $SUDO rm -rf /usr/local/libexec/gpconnect-tray
 $SUDO rm -f /usr/share/polkit-1/actions/io.github.gpconnect-tray.policy
 echo "Removed. Settings remain in ~/.config/gpconnect-tray/"

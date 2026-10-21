@@ -30,6 +30,20 @@ If a tunnel was started from a terminal instead, the icon still shows it as conn
 - Settings: portal, browser, gateway (empty = `--auto-gateway`), IPv6, OpenSSL mode, autostart, auto-connect.
 - Config: `~/.config/gpconnect-tray/config.json`
 
+## Troubleshooting
+
+**Browser says "Authentication Complete" but the tray keeps waiting.** The browser hands the
+sign-in back through a `globalprotectcallback:` link that `xdg-open` passes to `gpgui.desktop`.
+GlobalProtect-openconnect 3.x ships `Exec="/usr/bin/gpclient" launch-gui %u`. Outside GNOME/KDE
+(e.g. i3), xdg-utils 1.1.x does not strip those quotes and fails silently (`Permission denied`).
+The tray writes a user-level `~/.local/share/applications/gpgui.desktop` with an unquoted `Exec`
+before every connect. To check by hand:
+
+```sh
+xdg-open globalprotectcallback:test   # good: "No external-browser authentication is waiting…"
+                                      # bad:  "xdg-open: …: Permission denied"
+```
+
 ## Uninstall
 
 ```sh
